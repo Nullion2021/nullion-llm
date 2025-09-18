@@ -424,3 +424,296 @@ class MoEGate(nn.Module):
             aux_loss = 0
         # 返回: Top-K专家索引 Top-k归一化权重 辅助损失
         return topk_idx, topk_weight, aux_loss
+
+class MOEFeedForward(nn.Module):
+    def __init__(self, config: NullionConfig):
+        super().__init__()
+        self.config = config
+
+        # 初始化路由专家列表,每个专家都是一个FeedForward网络
+        self.experts = nn.ModuleList([
+            FeedForward(config)
+            for _ in range(config.n_routed_experts)
+        ])
+        # 初始化门控模块:负责决定输入分配给哪些路由专家
+        self.gate = MoEGate(config)
+        # 若配置中制定了共享专家数量, 则初始化"共享专家"列表
+        # 共享专家会处理所有输入
+        if config.n_shared_experts > 0:
+            self.shared_experts = nn.ModuleList([
+                FeedForward(config)
+                for _ in range(config.n_shared_experts)
+            ])
+
+    def forward(self, x):
+        """
+            MoE前馈网络的前向传播：
+            1. 门控模块决定输入分配给哪些路由专家
+            2. 路由专家处理被分配的输入，共享专家处理所有输入
+            3. 融合所有专家的输出，返回最终结果
+            Args:
+                x: 输入张量，形状为(bsz, seq_len, hidden_size)
+            Returns:
+                y: 融合后的输出张量，形状与输入一致(bsz, seq_len, hidden_size)
+        """
+        # 保存输入的原始值
+        identity = x
+        # 保存输入的原始形状
+        orig_shape = x.shape
+        # 解析输入形状
+        bsz, seq_len, _ = x.shape
+
+        # 1. 门控路由：通过门控模块获取每个token的Top-K专家索引和权重，以及辅助损失
+        # topk_idx: 形状(bsz*seq_len, top_k)，每个token被分配的专家索引
+        # topk_weight: 形状(bsz*seq_len, top_k)，每个专家的权重（用于融合输出）
+        # aux_loss: 门控模块计算的辅助损失（用于平衡专家负载）
+        topk_idx, topk_weight, aux_loss = self.gate(x)
+
+        # 2. 输入重塑：将(bsz, seq_len, hidden_size)展平为(bsz*seq_len, hidden_size)
+        # 目的：将每个token视为独立样本，便于按专家分配处理
+        x = x.view(-1, x.shape[-1])
+
+        # 将Top-K专家索引展平为1维：(bsz*seq_len*top_k,)
+        # 每个元素对应一个"token-专家"对的索引
+        flat_topk_idx = topk_idx.view(-1)
+        # 训练阶段：路由专家处理被分配的输入（并行度优先）
+        if self.training:
+            # 复制输入：每个token复制top_k次（与Top-K专家数量匹配）
+            # 形状从(bsz*seq_len, hidden_size)变为(bsz*seq_len*top_k, hidden_size)
+            x = x.repeat_interleave(self.config.num_experts_per_tok, dim=0)
+
+            # 初始化专家输出容器，形状与复制后的x一致（用float16节省内存）
+            y = torch.empty_like(x, dtype=torch.float16)
+
+            # 遍历每个专家，处理被分配给该专家的token
+            for i, expert in enumerate(self.experts):
+                # 筛选出分配给当前专家i的token索引（flat_topk_idx中等于i的位置）
+                # 专家处理这些token，并将结果存入输出容器的对应位置（确保数据类型一致）
+                y[flat_topk_idx == i] = expert(x[flat_topk_idx == i]).to(y.dtype)  # 确保类型一致
+
+            # 融合专家输出：
+            # a. 将y重塑为(bsz*seq_len, top_k, hidden_size)
+            # b. 与topk_weight（形状(bsz*seq_len, top_k)）按元素相乘（权重加权）
+            # c. 沿top_k维度求和，得到每个token的最终融合结果（形状(bsz*seq_len, hidden_size)）
+            y = (y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)).sum(dim=1)
+            # 将输出重塑为原始输入形状(bsz, seq_len, hidden_size)
+            y = y.view(*orig_shape)
+
+        # 推理阶段：路由专家处理被分配的输入（效率优先，使用缓存机制）
+        else:
+            # 调用moe_infer方法进行高效推理，返回形状(bsz*seq_len, hidden_size)
+            # 再重塑为原始形状(bsz, seq_len, hidden_size)
+            y = self.moe_infer(x, flat_topk_idx, topk_weight.view(-1, 1)).view(*orig_shape)
+
+        # 若存在共享专家，将其输出添加到路由专家的融合结果中（残差方式）
+        if self.config.n_shared_experts > 0:
+            for expert in self.shared_experts:
+                # 共享专家处理原始输入（identity），结果与y相加
+                y = y + expert(identity)
+        self.aux_loss = aux_loss
+        return y
+
+    @torch.no_grad() # 推理阶段禁用梯度计算，提高效率
+    def moe_infer(self, x, flat_expert_indices, flat_expert_weights):
+        """
+           MoE推理阶段的高效实现：按专家分组处理输入，减少冗余计算
+           Args:
+               x: 展平后的输入张量，形状(bsz*seq_len, hidden_size)
+               flat_expert_indices: 展平的专家索引，形状(bsz*seq_len*top_k,)
+               flat_expert_weights: 展平的专家权重，形状(bsz*seq_len*top_k, 1)
+           Returns:
+               expert_cache: 所有专家输出融合后的结果，形状(bsz*seq_len, hidden_size)
+        """
+        # 初始化专家输出缓存（用于累加所有专家的加权输出）
+        expert_cache = torch.zeros_like(x)
+
+        # 对专家索引排序，使同一专家的token连续排列（便于批量处理）
+        # idxs为排序后的索引位置，形状与flat_expert_indices一致
+        idxs = flat_expert_indices.argsort()
+
+        # 计算每个专家被分配的token数量（累计和）
+        # 例如：[6, 15, 20]表示专家0有6个token，专家1有9个（15-6），专家2有5个（20-15)
+        tokens_per_expert = flat_expert_indices.bincount().cpu().numpy().cumsum(0)
+
+        # 计算每个"token-专家"对对应的原始token索引（用于将结果映射回原始位置）
+        # 由于每个token被复制了top_k次，通过整除top_k得到原始索引
+        token_idxs = idxs // self.config.num_experts_per_tok
+        # 当tokens_per_expert = [6, 15, 20, 26]，tokens_per_expert.shape[0]即为专家数量（此时为4）
+        # 且token_idxs = [3, 7, 19, 21, 24, 25,  4,  5,  6, 10, 11, 12...] 时
+        # 意味token_idxs[:6] -> [3, 7, 19, 21, 24, 25]这6个位置属于专家0处理的token（每个token有可能被多个专家处理，这取决于num_experts_per_tok）
+        # 接下来9个位置token_idxs[6:15] -> [4,  5,  6, 10, 11, 12...]属于专家1处理的token...依此类推
+        for i, end_idx in enumerate(tokens_per_expert):
+            start_idx = 0 if i == 0 else tokens_per_expert[i - 1]
+            if start_idx == end_idx:
+                continue
+
+            # 获取当前专家的网络实例
+            expert = self.experts[i]
+            # 筛选出当前专家处理的原始token索引（从排序后的token_idxs中截取）
+            exp_token_idx = token_idxs[start_idx:end_idx]
+            # 提取这些token的输入数据
+            expert_tokens = x[exp_token_idx]
+            # 专家处理输入，并转换为缓存的数据类型
+            expert_out = expert(expert_tokens).to(expert_cache.dtype)
+            # 应用专家权重（按元素相乘）
+            expert_out.mul_(flat_expert_weights[idxs[start_idx:end_idx]])
+            # 将加权后的专家输出累加到缓存的对应位置（scatter_add_实现按索引累加）
+            # 1. exp_token_idx.view(-1, 1).repeat(1, x.shape[-1])：将token索引扩展到隐藏层维度
+            # 2. 按扩展后的索引，将expert_out累加到expert_cache中
+            expert_cache.scatter_add_(0, exp_token_idx.view(-1, 1).repeat(1, x.shape[-1]), expert_out)
+
+        return expert_cache
+
+class NullionBlock(nn.Module):
+    """
+        MiniMind模型的基础构建块（Transformer块），包含一个自注意力层和一个前馈网络层，
+        采用残差连接（Residual Connection）和层归一化（Layer Normalization）增强训练稳定性。
+        支持可选的混合专家（MoE）前馈网络，通过配置动态切换。
+        """
+    def __init__(self, layer_id: int, config: NullionConfig):
+        super().__init__()
+        # 保存注意力头数（从配置文件获取）
+        self.num_attention_heads = config.num_attention_heads
+        # 保存隐藏层维度（模型的特征维度，从配置文件获取）
+        self.hidden_size = config.hidden_size
+        self.head_dim = config.hidden_size // config.num_attention_heads
+        self.self_attn = Attention(config)
+
+        self.layer_id = layer_id
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # 初始化前馈网络：
+        # - 若不使用MoE（use_moe=False），则使用普通的FeedForward（门控前馈网络）
+        # - 若使用MoE（use_moe=True），则使用MOEFeedForward（混合专家前馈网络）
+        self.mlp = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
+
+    def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
+        residual = hidden_states
+        hidden_states, present_key_value = self.self_attn(
+            self.input_layernorm(hidden_states), position_embeddings,
+            past_key_value, use_cache, attention_mask
+        )
+        hidden_states += residual
+        hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
+        return hidden_states, present_key_value
+
+class NullionModel(nn.Module):
+    def __init__(self, config: NullionConfig):
+        super().__init__()
+        self.config = config
+        self.vocab_size, self.num_hidden_layers = config.vocab_size, config.num_hidden_layers
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.dropout = nn.Dropout(config.dropout)
+        self.layers = nn.ModuleList([NullionBlock(l, config) for l in range(self.num_hidden_layers)])
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        freqs_cos, freqs_sin = precompute_freqs_cis(dim=config.hidden_size // config.num_attention_heads,
+                                                    end=config.max_position_embeddings, theta=config.rope_theta)
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
+
+    def forward(self,
+                input_ids: Optional[torch.Tensor] = None,
+                attention_mask: Optional[torch.Tensor] = None,
+                past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+                use_cache: bool = False,
+                **kwargs):
+        batch_size, seq_length = input_ids.shape
+        past_key_values = past_key_values or [None] * len(self.layers)
+        start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
+
+        hidden_states = self.dropout(self.embed_tokens(input_ids))
+
+        position_embeddings = (
+            self.freqs_cos[start_pos:start_pos + seq_length],
+            self.freqs_sin[start_pos:start_pos + seq_length]
+        )
+
+        presents = []
+        for layer_idx, (layer, past_key_value) in enumerate(zip(self.layers, past_key_values)):
+            hidden_states, present = layer(
+                hidden_states,
+                position_embeddings,
+                past_key_value=past_key_value,
+                use_cache=use_cache,
+                attention_mask=attention_mask
+            )
+            presents.append(present)
+
+        hidden_states = self.norm(hidden_states)
+
+        aux_loss = sum(
+            layer.mlp.aux_loss
+            for layer in self.layers
+            if isinstance(layer.mlp, MOEFeedForward)
+        )
+
+        return hidden_states, presents, aux_loss
+
+class NullionForCausalLM(PreTrainedModel, GenerationMixin):
+    """
+        MiniMind模型的因果语言建模（CausalLM）封装类，用于文本生成任务（如续写、翻译等）。
+        继承自HuggingFace的PreTrainedModel（提供模型加载/保存等基础功能）和GenerationMixin（提供文本生成方法）。
+    """
+
+    # 指定配置类, 用于模型参数初始化和配置管理
+    config_class = NullionConfig
+
+    def __init__(self, config: NullionConfig = None):
+        self.config = config or NullionConfig()
+        super().__init__(self.config)
+        # 初始化模型主体（NullionModel，包含嵌入层和多个NullionBlock）
+        self.model = NullionModel(self.config)
+        # 语言模型头（LM Head）：将隐藏层特征映射到词表维度，用于预测下一个token
+        # 输入维度：hidden_size（模型隐藏层维度），输出维度：vocab_size（词表大小）
+        # 无偏置（bias=False），符合大模型轻量化设计
+        self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
+
+        # 权重共享：将词嵌入层（embed_tokens）的权重与LM头的权重绑定
+        # 作用：减少参数量，同时在预训练中使输入嵌入和输出预测共享语义空间
+        self.model.embed_tokens.weight = self.lm_head.weight
+        self.OUT = CausalLMOutputWithPast()
+
+    def forward(self,
+                input_ids: Optional[torch.Tensor] = None,
+                attention_mask: Optional[torch.Tensor] = None,
+                past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+                use_cache: bool = False,
+                logits_to_keep: Union[int, torch.Tensor] = 0,
+                **args):
+        """
+        前向传播：输入token序列 → 模型主体处理 → 输出预测logits
+        Args:
+           input_ids: 输入token的索引序列，形状为(bsz, seq_len)
+           attention_mask: 注意力掩码，形状为(bsz, seq_len)，标记有效token位置
+           past_key_values: 历史KV缓存列表，每个元素为一个Transformer层的(K,V)缓存
+           use_cache: 是否缓存当前层的KV用于后续生成（推理时启用）
+           logits_to_keep: 控制输出logits的范围（仅保留最后N个token的预测结果）
+               - 整数N：保留最后N个token的logits
+               - 张量：按索引保留指定位置的logits
+           **args: 其他可选参数（如position_ids等）
+        Returns:
+           CausalLMOutputWithPast: 包含logits、past_key_values等的输出对象
+       """
+
+        # h: 最后一层的隐藏层特征，形状为(bsz, seq_len, hidden_size)
+        # past_kvs: 当前层的KV缓存列表（若use_cache=True）
+        # aux_loss: 混合专家模型的辅助损失（用于负载均衡）
+        h, past_kvs, aux_loss = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            **args
+        )
+        # 确定需要保留的logits范围（优化效率，避免计算所有位置的logits）
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        # s计算预测logits：通过LM头将隐藏层特征映射到词表维度
+        logits = self.lm_head(h[:, slice_indices, :])
+
+        # 4. 填充输出对象
+        self.OUT.__setitem__('last_hidden_state', h)
+        self.OUT.__setitem__('logits', logits)
+        self.OUT.__setitem__('aux_loss', aux_loss)
+        self.OUT.__setitem__('past_key_values', past_kvs)
+        return self.OUT
