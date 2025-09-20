@@ -123,21 +123,10 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     # 辅助函数:将输入向量的后一半维度与前一半维度进行旋转拼接,实现复数域中的选择操作
     def rotate_half(x):
         return torch.cat((-x[..., x.shape[-1] // 2:], x[..., : x.shape[-1] // 2]), dim=-1)
-
-    # 根据位置索引选择对应的cos和sin值
-    if position_ids is None:
-        cos = cos[position_ids]
-        sin = sin[position_ids]
-
-    # 扩展cos和sin的维度,使其与q/k的维度对齐(多头维度)
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-
-    # 对查询向量应用旋转编码
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-
+    q_embed = (q * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(q) * sin.unsqueeze(unsqueeze_dim))
+    k_embed = (k * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(k) * sin.unsqueeze(unsqueeze_dim))
     return q_embed, k_embed
+
 
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -154,7 +143,7 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     return (
         x[:, :, :, None, :]
         .expand(bs, slen, num_key_value_heads, n_rep, head_dim)
-        .reshape(bs, slen, num_key_value_heads * n_rep)
+        .reshape(bs, slen, num_key_value_heads * n_rep, head_dim)
     )
 
 
@@ -310,12 +299,12 @@ class FeedForward(nn.Module):
         # 获取激活函数
         self.act_fn = ACT2FN[config.hidden_act]
 
-        def forward(self, x):
-            # 门控机制计算流程：
-            # 1. 门控路径：输入 → 门控投影 → 激活函数
-            # 2. 上投影路径：输入 → 上投影
-            # 3. 两路结果逐元素相乘 → 下投影 → dropout → 输出
-            return self.dropout(self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x)))
+    def forward(self, x):
+        # 门控机制计算流程：
+        # 1. 门控路径：输入 → 门控投影 → 激活函数
+        # 2. 上投影路径：输入 → 上投影
+        # 3. 两路结果逐元素相乘 → 下投影 → dropout → 输出
+        return self.dropout(self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x)))
 
 class MoEGate(nn.Module):
     """
@@ -598,17 +587,34 @@ class NullionBlock(nn.Module):
         return hidden_states, present_key_value
 
 class NullionModel(nn.Module):
+    """
+        Nullion模型的主体结构，包含词嵌入层、多个Transformer块（NullionBlock）、
+        位置编码（RoPE）和最终的层归一化，是模型特征提取的核心模块。
+        支持混合专家（MoE）结构，可通过配置动态启用。
+    """
     def __init__(self, config: NullionConfig):
         super().__init__()
         self.config = config
+        # 获取词表大小和隐藏库层数
         self.vocab_size, self.num_hidden_layers = config.vocab_size, config.num_hidden_layers
+
+        # 词嵌入层: 将token索引映射为向量
+        # 输入维度: vocab_size词表大小, 输出维度: hidden_size 隐藏层维度
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+
+        # Dropout层: 用于训练时随机丢弃部分词嵌入, 防止过拟合
         self.dropout = nn.Dropout(config.dropout)
+
+        # Transformer块列表, 由多个NullionBlck组成
         self.layers = nn.ModuleList([NullionBlock(l, config) for l in range(self.num_hidden_layers)])
+        # 最终归一化层
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        # RoPE
         freqs_cos, freqs_sin = precompute_freqs_cis(dim=config.hidden_size // config.num_attention_heads,
                                                     end=config.max_position_embeddings, theta=config.rope_theta)
+
+        # 将预计算的位置编码注册为非持久化缓冲区
         self.register_buffer("freqs_cos", freqs_cos, persistent=False)
         self.register_buffer("freqs_sin", freqs_sin, persistent=False)
 
@@ -618,19 +624,27 @@ class NullionModel(nn.Module):
                 past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
                 use_cache: bool = False,
                 **kwargs):
+
+        # 解析输入形状
         batch_size, seq_length = input_ids.shape
+        # 初始化历史KV缓存
         past_key_values = past_key_values or [None] * len(self.layers)
+        # 计算当前序列的起始位置
         start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
 
+        # 词嵌入与Dropout, 将token转化为词向量, 再应用Dropout
         hidden_states = self.dropout(self.embed_tokens(input_ids))
 
+        # 获取当前序列的位置编码RoPE
         position_embeddings = (
             self.freqs_cos[start_pos:start_pos + seq_length],
             self.freqs_sin[start_pos:start_pos + seq_length]
         )
 
-        presents = []
+        # 多层Transformer块处理
+        presents = [] # 存储当前层的KV缓存
         for layer_idx, (layer, past_key_value) in enumerate(zip(self.layers, past_key_values)):
+            # 每个Transformer块处理输入特征, 返回更新后的特征和当前层的KV缓存
             hidden_states, present = layer(
                 hidden_states,
                 position_embeddings,
@@ -638,10 +652,13 @@ class NullionModel(nn.Module):
                 use_cache=use_cache,
                 attention_mask=attention_mask
             )
+            # 保存当前KV缓存
             presents.append(present)
 
+        # 最终层归一化
         hidden_states = self.norm(hidden_states)
 
+        # 计算混合专家MoE的辅助损失总和
         aux_loss = sum(
             layer.mlp.aux_loss
             for layer in self.layers
