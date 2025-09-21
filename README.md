@@ -16,10 +16,17 @@ nullion-llm/
 ├── model/                   # 模型实现目录
 │   ├── __init__.py         # 模块初始化
 │   ├── nullion.py          # 主要模型实现
-│   └── model_nullion.py    # 参考模型实现
+│   ├── model_nullion.py    # 参考模型实现
+│   ├── tokenizer.json       # 分词器词汇表
+│   └── tokenizer_config.json # 分词器配置
+├── Data/                    # 数据处理目录
+│   ├── lm_dataset.py       # 数据集类实现
+│   └── *.jsonl             # 训练数据文件
 ├── test/                    # 测试文件目录
-│   └── modeltest.py        # 模型测试文件
-├── Data/                    # 数据集目录
+│   ├── modeltest.py        # 模型测试文件
+│   └── datasettest.py      # 数据集测试文件
+├── scripts/                 # 训练脚本目录
+│   └── train_pretrain.py   # 预训练脚本
 └── README.md               # 项目说明文档
 ```
 
@@ -190,6 +197,48 @@ config = NullionConfig(
 - [MiniMind项目](https://github.com/jingyaogong/minimind/tree/master)
 - [Attention Is All You Need](https://arxiv.org/abs/1706.03762)
 - [RoPE: Rotary Position Embedding](https://arxiv.org/abs/2104.09864)
+
+## 📝 开发日志
+
+### 2025年1月21日
+
+#### 数据集处理模块实现 (Data/lm_dataset.py)
+实现了三个完整的数据集类，支持不同训练阶段的数据处理：
+
+1. **PretrainDataset**: 预训练数据集
+   - 支持JSONL格式的文本数据加载
+   - 自动序列长度控制和截断
+   - 生成自回归训练的输入-目标对
+   - 创建损失掩码，支持填充token的忽略
+
+2. **SFTDataset**: 监督微调数据集
+   - 处理对话格式的数据
+   - 使用聊天模板格式化对话
+   - 智能损失掩码，只对助手回复计算损失
+   - 支持多轮对话数据处理
+
+3. **DPODataset**: 直接偏好优化数据集
+   - 处理chosen/rejected偏好对数据
+   - 为chosen和rejected回复分别生成训练数据
+   - 保持数据一致性，便于偏好学习
+
+#### 分词器配置文件
+在model/目录下添加了tokenizer相关文件：
+
+- **tokenizer.json**: 分词器词汇表和编码规则
+- **tokenizer_config.json**: 分词器配置参数和特殊标记定义
+- 支持本地加载，无需网络下载预训练模型
+
+#### 数据处理特性
+- **模块化设计**: 三个数据集类继承统一接口，易于扩展
+- **灵活性**: 支持不同的tokenizer和序列长度配置
+- **效率优化**: 批量处理和内存优化
+- **健壮性**: 完善的错误处理和数据验证
+
+#### 测试框架
+- **datasettest.py**: 完整的数据集测试套件
+- **simple_test.py**: 简化的测试脚本，便于调试
+- 支持本地tokenizer加载，避免网络依赖
 
 ---
 
