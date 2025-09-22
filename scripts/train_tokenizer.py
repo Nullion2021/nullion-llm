@@ -20,7 +20,7 @@ def train_tokenizer():
                 data = json.loads(line)
                 yield data['text']
 
-    data_path = '/home/chenyinlin/Data/gongjy/minimind_dataset/pretrain_hq.jsonl'
+    data_path = '../../Data/gongjy/minimind_dataset/pretrain_hq.jsonl'
 
     # 初始化tokenizer
     tokenizer = Tokenizer(models.BPE())
@@ -52,10 +52,10 @@ def train_tokenizer():
     assert tokenizer.token_to_id("<|im_end|>") == 2
 
     # 保存tokenizer
-    tokenizer_dir = "/home/chenyinlin/tmp/llm/model"
+    tokenizer_dir = "./llm/model"
     os.makedirs(tokenizer_dir, exist_ok=True)
     tokenizer.save(os.path.join(tokenizer_dir, "tokenizer.json"))
-    tokenizer.model.save("/home/chenyinlin/tmp/llm/model")
+    tokenizer.model.save("./llm/model")
 
     # 手动创建配置文件
     config = {
@@ -112,7 +112,7 @@ def eval_tokenizer():
     from transformers import AutoTokenizer
 
     # 加载预训练的tokenizer
-    tokenizer = AutoTokenizer.from_pretrained("../model/")
+    tokenizer = AutoTokenizer.from_pretrained("./tmp/llm/model/")
 
     messages = [
         {"role": "system", "content": "你是一个优秀的聊天机器人，总是给我正确的回应！"},

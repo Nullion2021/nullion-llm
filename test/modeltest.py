@@ -10,7 +10,7 @@ def test_attention():
     config = ModelConfig()
     attention = Attention(config)
     batch_size = 2
-    seq_len = 128
+    seq_len = 512
     x = torch.randn(batch_size, seq_len, config.hidden_size)
 
     head_dim = config.hidden_size // config.num_attention_heads

@@ -200,7 +200,7 @@ config = NullionConfig(
 
 ## 📝 开发日志
 
-### 2025年1月21日
+### 2025年9月22日
 
 #### 数据集处理模块实现 (Data/lm_dataset.py)
 实现了三个完整的数据集类，支持不同训练阶段的数据处理：
@@ -239,6 +239,108 @@ config = NullionConfig(
 - **datasettest.py**: 完整的数据集测试套件
 - **simple_test.py**: 简化的测试脚本，便于调试
 - 支持本地tokenizer加载，避免网络依赖
+
+#### 预训练脚本使用 (trainer/train_pretrain.py)
+支持单GPU和多GPU分布式训练：
+
+**单GPU训练**:
+```bash
+# 基本训练
+python trainer/train_pretrain.py \
+    --epochs 1 \
+    --batch_size 32 \
+    --learning_rate 5e-4 \
+    --device cuda:0 \
+    --max_seq_len 512 \
+    --data_path /path/to/pretrain_data.jsonl
+
+# 使用wandb记录
+python trainer/train_pretrain.py \
+    --epochs 2 \
+    --batch_size 16 \
+    --learning_rate 1e-4 \
+    --use_wandb \
+    --wandb_project Nullion-Pretrain \
+    --save_interval 200 \
+    --log_interval 50
+```
+
+**多GPU分布式训练**:
+```bash
+# 使用torch run进行多GPU训练
+torch run --nproc_per_node=4 trainer/train_pretrain.py \
+    --epochs 3 \
+    --batch_size 8 \
+    --learning_rate 5e-4 \
+    --ddp \
+    --accumulation_steps 4 \
+    --max_seq_len 1024 \
+    --hidden_size 768 \
+    --num_hidden_layers 12
+
+# 8卡训练示例
+torch run --nproc_per_node=8 trainer/train_pretrain.py \
+    --epochs 1 \
+    --batch_size 4 \
+    --learning_rate 1e-3 \
+    --ddp \
+    --accumulation_steps 8 \
+    --use_wandb \
+    --wandb_project Nullion-Large
+```
+
+**关键参数说明**:
+- `--epochs`: 训练轮数
+- `--batch_size`: 每个GPU的批次大小
+- `--learning_rate`: 学习率
+- `--ddp`: 启用分布式数据并行训练
+- `--accumulation_steps`: 梯度累积步数，模拟更大batch size
+- `--hidden_size`: 模型隐藏层维度
+- `--num_hidden_layers`: Transformer层数
+- `--max_seq_len`: 最大序列长度
+- `--use_wandb`: 启用wandb记录训练过程
+
+---
+
+## 🐛 常见错误和解决方案
+
+### CUDA索引越界错误
+
+**错误信息**: `../aten/src/ATen/native/cuda/Indexing.cu:1289: indexSelectLargeIndex: block: [153,0,0], thread: [96,0,0] Assertion 'srcIndex < srcSelectDimSize' failed.`
+
+**问题原因**:
+- 使用了错误的分词器加载函数`PreTrainedTokenizerFast`，应该使用`AutoTokenizer`
+- `PreTrainedTokenizerFast`可能产生超出模型`vocab_size`范围的token ID
+- 例如：模型`vocab_size=6400`，但输入包含了token ID 6401
+
+**解决方案**:
+1. 在模型前向传播中添加输入验证
+2. 使用`torch.clamp()`将越界的token ID限制在有效范围内
+3. 检查分词器配置是否与模型配置匹配
+
+### MoE相关错误
+
+**错误信息**: `TypeError: unsupported operand type(s) for +=: 'Tensor' and 'NoneType'`
+
+**问题原因**:
+- 训练代码尝试添加`res.aux_loss`（None）到损失张量
+- 代码中包含了未使用的MoE（Mixture of Experts）相关逻辑
+
+**解决方案**:
+1. 移除训练脚本中的MoE路径逻辑
+2. 清理模型代码中的MoE相关注释
+3. 简化模型保存路径，不再包含MoE相关参数
+
+### 分词器加载问题
+
+**问题现象**:
+- 本地缺少tokenizer文件但运行环境存在
+- 分词器生成的token ID与模型vocab_size不匹配
+
+**解决方案**:
+1. 使用`AutoTokenizer.from_pretrained()`替代`PreTrainedTokenizerFast`
+2. 确保分词器词汇表大小与模型配置一致
+3. 验证特殊token的ID映射是否正确
 
 ---
 

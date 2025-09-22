@@ -1,15 +1,13 @@
 # Model Config(配置类)
 
 import torch
-import torch.nn as nn
+from torch import nn
 import torch.nn.functional as F
 import math
 from typing import Optional, Tuple, List, Union
 from transformers import PretrainedConfig, PreTrainedModel, GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.activations import ACT2FN
-
-from model.model_nullion import NullionConfig
 
 
 class ModelConfig(PretrainedConfig):
@@ -47,7 +45,7 @@ class ModelConfig(PretrainedConfig):
 
 # RMSNorm层实现
 
-class RMSNorm(nn.Module):
+class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
         self.eps = eps
@@ -145,6 +143,7 @@ class Attention(nn.Module):
             torch.full((seq_len, seq_len), float("-inf"), device=scores.device),
             diagonal=1
         ).unsqueeze(0).unsqueeze(0)
+
 
         # 对注意力分数应用softmax，得到注意力权重
         scores = F.softmax(scores.float(), dim=-1).type_as(x)
@@ -251,7 +250,6 @@ class NullionModel(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
         self.layers = nn.ModuleList([ModelBlock(l, config) for l in range(self.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
         freqs_cos, freqs_sin = precompute_freqs_cis(dim=config.hidden_size // config.num_attention_heads,
                                                     end=config.max_position_embeddings, theta=config.rope_theta)
 
@@ -264,6 +262,19 @@ class NullionModel(nn.Module):
         """模型前向传播"""
         # 获取输入形状：批次大小和序列长度
         batch_size, seq_len = input_ids.shape
+
+        # 调试：检查input_ids的范围
+        if input_ids.max() >= self.config.vocab_size:
+            print(f"ERROR: input_ids contains values >= vocab_size ({self.config.vocab_size})")
+            print(f"input_ids min: {input_ids.min()}, max: {input_ids.max()}")
+            print(f"input_ids shape: {input_ids.shape}")
+            print(f"Unique invalid values: {torch.unique(input_ids[input_ids >= self.config.vocab_size])}")
+            raise ValueError(f"input_ids contains values >= vocab_size ({self.config.vocab_size})")
+
+        if input_ids.min() < 0:
+            print(f"ERROR: input_ids contains negative values")
+            print(f"input_ids min: {input_ids.min()}, max: {input_ids.max()}")
+            raise ValueError(f"input_ids contains negative values")
 
         # 词嵌入：将token索引转换为词向量，并应用dropout
         hidden_states = self.dropout(self.embed_tokens(input_ids))
@@ -294,7 +305,7 @@ class NullionForCausalLM(PreTrainedModel, GenerationMixin):
     """
 
     # 指定配置类, 用于模型参数初始化和配置管理
-    config_class = NullionConfig
+    config_class = ModelConfig
 
     def __init__(self, config: ModelConfig = None):
         self.config = config or ModelConfig()
@@ -314,8 +325,6 @@ class NullionForCausalLM(PreTrainedModel, GenerationMixin):
     def forward(self,
                 input_ids: Optional[torch.Tensor] = None,
                 attention_mask: Optional[torch.Tensor] = None,
-                past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
-                use_cache: bool = False,
                 logits_to_keep: Union[int, torch.Tensor] = 0,
                 **args):
         """
@@ -337,8 +346,6 @@ class NullionForCausalLM(PreTrainedModel, GenerationMixin):
         h = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
             **args
         )
 
@@ -350,6 +357,6 @@ class NullionForCausalLM(PreTrainedModel, GenerationMixin):
         # 填充输出对象
         self.OUT.__setitem__('last_hidden_state', h)
         self.OUT.__setitem__('logits', logits)
-        self.OUT.__setitem__('aux_loss', None)  # 当前模型没有MoE，aux_loss为None
+        self.OUT.__setitem__('aux_loss', None)
         self.OUT.__setitem__('past_key_values', None)  # 当前模型没有KV缓存
         return self.OUT

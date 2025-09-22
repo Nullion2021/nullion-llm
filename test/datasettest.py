@@ -4,14 +4,14 @@ from transformers import AutoTokenizer
 from Data.lm_dataset import PretrainDataset
 
 # 从本地model文件夹加载tokenizer配置
-tokenizer = AutoTokenizer.from_pretrained("/home/chenyinlin/tmp/llm/model/")
+tokenizer = AutoTokenizer.from_pretrained("model/")
 
 # 创建预训练数据集实例
 # 参数说明：
 # - data_path: 预训练数据文件路径 (JSONL格式，每行包含text字段)
 # - tokenizer: 分词器，用于文本编码
 # - max_length: 最大序列长度，超过此长度的文本将被截断
-train_ds = PretrainDataset("/home/chenyinlin/tmp/llm/Data/pretrain_hq.jsonl",
+train_ds = PretrainDataset("Data/pretrain_hq.jsonl",
                            tokenizer,
                            max_length=512)
 
