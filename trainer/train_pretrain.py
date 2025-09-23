@@ -130,7 +130,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Nullion Pretraining')
     parser.add_argument("--out_dir", type=str, default= "../out")
     # 若要以最快速度实现zero则epochs设置为1轮；否则应当利用有限的数据训练2~6个epochs。
-    parser.add_argument("--epochs", type=int, default=1)  # 训练轮数参数
+    parser.add_argument("--epochs", type=int, default=6)  # 训练轮数参数
     parser.add_argument("--batch_size", type=int, default=32)  # 批次大小参数
     parser.add_argument("--learning_rate", type=float, default=5e-4)  # 学习率参数
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")  # 设备选择参数
@@ -181,7 +181,7 @@ if __name__ == "__main__":
     if args.use_wandb and (not ddp or ddp_local_rank == 0):
         import wandb
 
-        wandb.init(project=args.wandb_project, name=args.wandb_run_name)
+        wandb.init(mode="offline",project=args.wandb_project, name=args.wandb_run_name)
     else:
         wandb = None
 
